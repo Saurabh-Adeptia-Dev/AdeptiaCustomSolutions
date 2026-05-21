@@ -1,0 +1,54 @@
+import com.adeptia.mail.EmailReader;
+import java.util.List;
+
+String  PROTOCOL           = "imap";
+String  HOST               = "imap.gmail.com";
+String  PORT               = "993";
+String  USERNAME           = "saurabhadeptia.sharma@gmail.com";
+String  PASSWORD           = "mkqa psdn cbcq lpbj";
+boolean USE_SSL            = true;
+// Single base path — all mail folders created as BASE_PATH/mailUniqueId/
+String  BASE_PATH          = "/shared/mnt/input/";
+
+// FILTER_UNREAD      : true  = unread emails only | false = all
+// FILTER_SUBJECT     : ""    = all | "Invoice" = keyword | "Inv.*" = regex
+// FILTER_SENDER      : ""    = all | "john@gmail.com" | ".*@gmail\\.com" = regex
+// FILTER_ATTACHMENT : ""    = all types | "pdf,xlsx" = specific extensions
+//                      all emails are read regardless of attachment presence;
+//                      attachments are saved when found and match the type filter
+// 
+boolean FILTER_UNREAD      = true;
+String  FILTER_SUBJECT     = "*Test*";
+String  FILTER_SENDER      = "saurabh.sharma@adeptia.com";
+String  FILTER_ATTACHMENT = "*.pdf";
+
+String result = EmailReader.readEmails(
+    PROTOCOL, HOST, PORT, USERNAME, PASSWORD, USE_SSL,
+    BASE_PATH,
+    FILTER_UNREAD, FILTER_SUBJECT,
+    FILTER_SENDER, FILTER_ATTACHMENT
+);
+
+String filePathsString = "";
+
+if (result.startsWith("FAILURE")) {
+    System.out.println("Plugin failed: " + result);
+} else {
+    // Step 1: build List<String> of file paths (skip "Files saved: N" at index 0)
+    List filePaths = new ArrayList();
+    String[] lines = result.split("\n");
+    for (int i = 1; i < lines.length; i++) {
+        if (lines[i] != null && !lines[i].trim().isEmpty()) {
+            filePaths.add(lines[i].trim());
+        }
+    }
+
+    // Step 2: convert List<String> back to a single comma-separated String
+    StringBuilder sb = new StringBuilder();
+    for (int i = 0; i < filePaths.size(); i++) {
+        if (i > 0) sb.append(",");
+        sb.append(filePaths.get(i));
+    }
+    filePathsString = sb.toString();
+    context.put("FilePaths",filePathsString);
+}

@@ -1,0 +1,5 @@
+com\adeptia\zendesk\PrintTicketPdf$ErrorRow.class
+com\adeptia\zendesk\PrintTicketPdf$StringResponse.class
+com\adeptia\zendesk\PrintTicketPdf$UserDisplay.class
+com\adeptia\zendesk\PrintTicketPdf.class
+com\adeptia\zendesk\ZendeskSearchExportIds.class

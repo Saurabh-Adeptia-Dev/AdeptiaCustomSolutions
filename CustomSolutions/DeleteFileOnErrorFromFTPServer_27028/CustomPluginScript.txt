@@ -1,0 +1,21 @@
+import com.adeptia.ftp.FTPFileDeleter;
+import java.util.*;
+
+Map eventMap = (Map) context.get("EventContextMap");
+String remoteFilePath = "N.A.";
+String eventId = "N.A.";
+if(eventMap != null){
+remoteFilePath =(String)eventMap.get("remoteFilePath");
+eventId = (String) eventMap.get("EventID");
+eventId = (eventId != null)
+        ? eventId.replace("FTPEvent:", "").trim()
+        : "";
+}
+
+boolean isDelete = FTPFileDeleter.deleteFile(eventId,remoteFilePath);
+if(isDelete==true){
+	context.put("FileDeletionStatus","File Deleted Successfully");
+}
+else{
+	context.put("FileDeletionStatus","File is not deleted");
+}

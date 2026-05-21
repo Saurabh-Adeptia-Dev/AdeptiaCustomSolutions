@@ -1,0 +1,12 @@
+To override the exceptionMessage in the Process Flow/Transaction, we need to implement a custom solution. Please follow the steps below:
+Download the attached file CustomExceptionMessageHandling.jar.txt and rename it to CustomExceptionMessageHandling.jar.
+Create a directory named runtime under the following path:
+Shared/ext/
+Place the renamed JAR file inside the runtime directory.
+Edit the Runtime Deployment and add the following JVM parameter:
+
+-Dloader.path=app/ext/,app/customClasses/,shared/ext/runtime
+If you are using a dedicated deployment, please follow the same process for that deployment as well.
+Restart the Runtime microservice after making the above changes.
+Once the environment is up, define the customExceptionMessage variable in the process flow exception script. Please refer to the attached screenshot for reference.
+Run the same flow again and share the outcome with us.
