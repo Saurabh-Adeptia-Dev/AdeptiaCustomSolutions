@@ -1,0 +1,65 @@
+import com.adeptia.ftp.AdeptiaFileRouter;
+import com.adeptia.ftp.FTPConnectionManager;
+import java.util.List;
+import java.util.ArrayList;
+
+String srcAccountId=service.getValueByName("SrcAccountId");
+String tgtAccountId = service.getValueByName("TgtAccountId");
+
+String srcPath     = service.getValueByName("SourcePath");
+String tgtBasePath = service.getValueByName("TargetBasePath");
+String xmlPath = service.getValueByName("XmlPath");
+boolean parallelMode     = Boolean.parseBoolean(service.getValueByName("parallelMode"));  // false = sequential | true = parallel
+int  concurrencyLimit      = Integer.parseInt(service.getValueByName("concurrencyLimit"));      // Number of parallel File Transfer
+boolean deleteFileOnSuccess = Boolean.parseBoolean(service.getValueByName("deleteFileOnSuccess"));
+boolean createUniqueFile= Boolean.parseBoolean(service.getValueByName("createUniqueFile"));
+
+// -- Execute Transfer -------------------------------------------------
+List summary = AdeptiaFileRouter.transfer(
+    srcAccountId,
+    tgtAccountId,
+    srcPath,
+    tgtBasePath,
+    xmlPath,
+    parallelMode,
+    concurrencyLimit,
+    deleteFileOnSuccess,
+    createUniqueFile
+);
+
+int total   = Integer.parseInt(((String) summary.get(0)).split(":")[1]);
+int success = Integer.parseInt(((String) summary.get(1)).split(":")[1]);
+int failed  = Integer.parseInt(((String) summary.get(2)).split(":")[1]);
+List failedFiles = new ArrayList();
+for (int i = 7; i < summary.size(); i++) {
+    String line = (String) summary.get(i);
+    if (line.startsWith("[FAIL]")) {
+        String filePart  = line.substring(7);           
+        int    arrowIdx  = filePart.indexOf(" -> ");
+        String fileName  = (arrowIdx > 0)
+                ? filePart.substring(0, arrowIdx).trim()
+                : filePart.trim();
+        String errorMsg  = (arrowIdx > 0)
+                ? filePart.substring(arrowIdx + 4).trim()
+                : "";
+        failedFiles.add(fileName + " | " + errorMsg);
+    }
+}
+
+StringBuffer failedBuffer = new StringBuffer();
+for (int i = 0; i < failedFiles.size(); i++) {
+    if (i > 0) failedBuffer.append("\n");
+    failedBuffer.append((String) failedFiles.get(i));
+}
+
+context.put("TotalFileReceived",        String.valueOf(total));
+context.put("TotalSuccessFiles",      String.valueOf(success));
+context.put("TotalFailedFiles",       String.valueOf(failed));
+if(failed>0){
+context.put("FailedFileList", failedBuffer.toString());
+}
+int activeNow = FTPConnectionManager.getActiveConnectionCount();
+if (activeNow > 0) {
+    context.put("aft_connection_leak",
+            "WARNING: " + activeNow + " connection(s) not closed. Check logs.");
+}
