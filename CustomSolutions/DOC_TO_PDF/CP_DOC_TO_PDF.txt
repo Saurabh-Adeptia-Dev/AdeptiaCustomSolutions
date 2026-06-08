@@ -1,0 +1,887 @@
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFParagraph;
+import org.apache.poi.xwpf.usermodel.XWPFRun;
+import org.apache.poi.xwpf.usermodel.XWPFTable;
+import org.apache.poi.xwpf.usermodel.XWPFTableRow;
+import org.apache.poi.xwpf.usermodel.XWPFTableCell;
+import org.apache.poi.xwpf.usermodel.XWPFPicture;
+import org.apache.poi.xwpf.usermodel.XWPFPictureData;
+import org.apache.poi.xwpf.usermodel.IBodyElement;
+import org.apache.poi.openxml4j.opc.OPCPackage;
+import org.apache.poi.openxml4j.opc.PackagePart;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDType1Font;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.regex.Pattern;
+import com.adeptia.indigo.logging.Logger;
+import com.adeptia.indigo.services.ServiceException;
+
+String CLAUDE_URL = "https://api.anthropic.com/v1/messages";
+String MODEL      = "claude-sonnet-4-6";   // FIX#9: corrected from invalid "claude-opus-4-6"
+int    MAX_TOKENS = 4096;
+float  MARGIN     = 50f;
+float  BODY_SIZE  = 11f;
+float  DEFAULT_SPACE_AFTER  = 8f;  // Word Normal default = w:after="160" (160/20=8pt)
+float  DEFAULT_SPACE_BEFORE = 0f;
+float  CELL_PAD   = 4f;
+float  TABLE_GAP  = 12f;
+float  IMAGE_GAP  = 8f;
+float  LINE_MULT  = 1.20f; // FIX#11: standard PDF line height (was 1.45 — too loose)
+float  PAGE_W     = PDRectangle.A4.getWidth();
+float  PAGE_H     = PDRectangle.A4.getHeight();
+float  CONTENT_W  = PAGE_W - 2 * MARGIN;
+String apiKey       = service.getValueByName("API_KEY");
+InputStream  inputStream  = service.getSourceStream();
+OutputStream outputStream = service.getOutputStream();
+
+
+float measureW(String text, PDType1Font font, float size) {
+    if (text == null || text.length() == 0) return 0f;
+    try {
+        return font.getStringWidth(text) / 1000f * size;
+    } catch (Exception e) {
+        return text.length() * size * 0.50f; // safe fallback
+    }
+}
+
+String sanitize(String text) {
+    if (text == null) return "";
+    StringBuffer sb = new StringBuffer();
+    for (int i = 0; i < text.length(); i++) {
+        char c = text.charAt(i);
+        if      (c == 0x2014 || c == 0x2013 || c == 0x2012) sb.append('-');
+        else if (c == 0x2018 || c == 0x2019 || c == 0x201A) sb.append('\'');
+        else if (c == 0x201C || c == 0x201D || c == 0x201E) sb.append('"');
+        else if (c == 0x2026) sb.append("...");
+        else if (c == 0x2022 || c == 0x2023 || c == 0x25E6) sb.append('*');
+        else if (c == 0x00A0 || c == 0x202F || c == 0x2009) sb.append(' ');
+        else if (c == 0x00D7) sb.append('x');
+        else if (c == 0x00F7) sb.append('/');
+        else if (c == 0x2212) sb.append('-');
+        else if (c == 0x00AE) sb.append("(R)");
+        else if (c == 0x00A9) sb.append("(C)");
+        else if (c == 0x2122) sb.append("(TM)");
+        else if (c == 0x20AC) sb.append("EUR");
+        else if (c == 0x00A3) sb.append("GBP");
+        else if (c == 0x00A5) sb.append("JPY");
+        else if (c == 0x00B0) sb.append("deg");
+        else if (c == 0x00B1) sb.append("+-");
+        else if (c == 0x00BD) sb.append("1/2");
+        else if (c == 0x00BC) sb.append("1/4");
+        else if (c == 0x00BE) sb.append("3/4");
+        else if (c == 0x2192) sb.append("->");
+        else if (c == 0x2190) sb.append("<-");
+        else if (c == 0x2194) sb.append("<->");
+        else if (c == 0x2713 || c == 0x2714) sb.append("[ok]");
+        else if (c == 0x2717 || c == 0x2718) sb.append("[x]");
+        // Accented Latin lowercase
+        else if (c == 0x00E9 || c == 0x00E8 || c == 0x00EA || c == 0x00EB) sb.append('e');
+        else if (c == 0x00E0 || c == 0x00E2 || c == 0x00E4) sb.append('a');
+        else if (c == 0x00FC || c == 0x00FA || c == 0x00FB) sb.append('u');
+        else if (c == 0x00F6 || c == 0x00F3 || c == 0x00F4) sb.append('o');
+        else if (c == 0x00EE || c == 0x00EF || c == 0x00EC) sb.append('i');
+        else if (c == 0x00E7) sb.append('c');
+        else if (c == 0x00F1) sb.append('n');
+        // Accented Latin uppercase
+        else if (c == 0x00C9 || c == 0x00C8 || c == 0x00CA || c == 0x00CB) sb.append('E');
+        else if (c == 0x00C0 || c == 0x00C2 || c == 0x00C4) sb.append('A');
+        else if (c == 0x00DC || c == 0x00DA || c == 0x00DB) sb.append('U');
+        else if (c == 0x00D6 || c == 0x00D3 || c == 0x00D4) sb.append('O');
+        else if (c == 0x00CE || c == 0x00CF || c == 0x00CC) sb.append('I');
+        else if (c == 0x00C7) sb.append('C');
+        else if (c == 0x00D1) sb.append('N');
+        // Safe printable ASCII
+        else if (c >= 0x20 && c <= 0x7E) sb.append(c);
+        // Whitespace normalisation
+        else if (c == '\n' || c == '\r') sb.append(' ');
+        else if (c == '\t') sb.append("    ");
+        // All other Unicode silently dropped — prevents PDType1Font encoding errors
+    }
+    return sb.toString();
+}
+
+List wrapToLines(String text, PDType1Font font, float fontSize, float maxWidth) {
+    List lines = new ArrayList();
+    if (text == null || text.trim().length() == 0) {
+        lines.add(""); return lines;
+    }
+    String[] words = text.split(" +");
+    StringBuffer cur = new StringBuffer();
+    for (int i = 0; i < words.length; i++) {
+        String w = words[i];
+        if (w.length() == 0) continue;
+        String candidate = cur.length() == 0 ? w : cur.toString() + " " + w;
+        if (cur.length() > 0 && measureW(candidate, font, fontSize) > maxWidth) {
+            lines.add(cur.toString());
+            cur = new StringBuffer(w);
+        } else {
+            cur = new StringBuffer(candidate);
+        }
+    }
+    if (cur.length() > 0) lines.add(cur.toString());
+    if (lines.isEmpty()) lines.add(text.trim());
+    return lines;
+}
+
+List elemType      = new ArrayList();
+List elemParaIdx   = new ArrayList();
+List elemTableRows = new ArrayList();
+List elemTableCols = new ArrayList();
+List elemImgBytes  = new ArrayList();
+
+List pRunsList     = new ArrayList();
+List pSizes        = new ArrayList();
+List pAligns       = new ArrayList(); // "left" | "center" | "right"
+List pIsHead       = new ArrayList(); // Boolean
+List pListItem     = new ArrayList(); // String bullet prefix, or null
+List pSpaceBefore  = new ArrayList(); // Float
+List pSpaceAfter   = new ArrayList(); // Float
+List pLineMult     = new ArrayList(); // Float
+List elemSpaceGap  = new ArrayList(); // Float or null
+
+HashMap styleColorMap = new HashMap();
+HashMap styleSizeMap  = new HashMap();
+HashMap styleBaseMap  = new HashMap(); // FIX#7: tracks basedOn chain for inheritance
+HashMap styleSpaceBeforeMap = new HashMap(); // Float: space before paragraph
+HashMap styleSpaceAfterMap  = new HashMap(); // Float: space after paragraph
+HashMap styleLineMultMap    = new HashMap(); // Float: line height multiplier
+
+XWPFDocument doc = null;
+try {
+    Logger.getLogger().info("[1] Opening DOCX...");
+    doc = new XWPFDocument(inputStream);
+    Logger.getLogger().info("[1] DOCX opened OK");
+
+    Logger.getLogger().info("[2] Reading styles.xml...");
+    try {
+        OPCPackage pkg = doc.getPackage();
+        List parts = pkg.getPartsByName(Pattern.compile("/word/styles.xml"));
+        if (parts.size() > 0) {
+            PackagePart sp = (PackagePart) parts.get(0);
+            BufferedReader br = new BufferedReader(
+                new InputStreamReader(sp.getInputStream(), "UTF-8"));
+            StringBuffer sx = new StringBuffer();
+            String ln;
+            while ((ln = br.readLine()) != null) sx.append(ln);
+            br.close();
+
+            String[] blks = sx.toString().split("<w:style ");
+            for (int bi = 1; bi < blks.length; bi++) {
+                String blk = blks[bi];
+
+                // styleId
+                int ii = blk.indexOf("w:styleId=\"");
+                if (ii < 0) continue;
+                String sid = blk.substring(ii + 11, blk.indexOf("\"", ii + 11));
+                if (sid.length() == 0) continue;
+
+                // FIX#7: basedOn — capture parent style for inheritance resolution
+                int boTag = blk.indexOf("<w:basedOn ");
+                if (boTag >= 0) {
+                    int bvi = blk.indexOf("w:val=\"", boTag);
+                    if (bvi >= 0) {
+                        int bvEnd = blk.indexOf("\"", bvi + 7);
+                        if (bvEnd > bvi + 7) {
+                            String bv = blk.substring(bvi + 7, bvEnd);
+                            if (bv.length() > 0) styleBaseMap.put(sid, bv);
+                        }
+                    }
+                }
+
+                // color: look for <w:color w:val="RRGGBB">
+                int ci = blk.indexOf("<w:color ");
+                if (ci >= 0) {
+                    int vi   = blk.indexOf("w:val=\"", ci);
+                    int eend = blk.indexOf("/>", ci);
+                    if (vi >= 0 && (eend < 0 || vi < eend)) {
+                        int vs  = vi + 7;
+                        int ve  = blk.indexOf("\"", vs);
+                        String val = blk.substring(vs, ve);
+                        if (val.length() == 6 && !val.equalsIgnoreCase("auto")) {
+                            try {
+                                styleColorMap.put(sid, new int[]{
+                                    Integer.parseInt(val.substring(0,2),16),
+                                    Integer.parseInt(val.substring(2,4),16),
+                                    Integer.parseInt(val.substring(4,6),16)});
+                            } catch (Exception ce) {
+                                throw new ServiceException(ce);
+                            }
+                        }
+                    }
+                }
+
+                // font size: <w:sz w:val="NNN">  — value is half-points
+                int szIdx = blk.indexOf("<w:sz ");
+                if (szIdx >= 0) {
+                    int vi   = blk.indexOf("w:val=\"", szIdx);
+                    int eend = blk.indexOf("/>", szIdx);
+                    if (vi >= 0 && (eend < 0 || vi < eend)) {
+                        try {
+                            int vs = vi + 7;
+                            float pts = Integer.parseInt(
+                                blk.substring(vs, blk.indexOf("\"", vs)).trim()) / 2f;
+                            styleSizeMap.put(sid, new Float(pts));
+                        } catch (Exception se) {
+                            throw new ServiceException(se);
+                        }
+                    }
+                }
+
+                // FIX#12: paragraph spacing — w:before/w:after in twips (1/20 pt),
+                // w:line in 1/240 of line height when lineRule="auto"
+                int spIdx = blk.indexOf("<w:spacing ");
+                if (spIdx >= 0) {
+                    int spEnd = blk.indexOf("/>", spIdx);
+                    if (spEnd < 0) spEnd = blk.indexOf(">", spIdx);
+                    String spTag = blk.substring(spIdx, spEnd + 2);
+                    // w:before
+                    int bfi = spTag.indexOf("w:before=\"");
+                    if (bfi >= 0) {
+                        try {
+                            int bfs = bfi + 10;
+                            float bf = Integer.parseInt(spTag.substring(bfs, spTag.indexOf("\"", bfs)).trim()) / 20f;
+                            styleSpaceBeforeMap.put(sid, new Float(bf));
+                        } catch (Exception spe) {
+                            throw new ServiceException(spe);
+                        }
+                    }
+                    // w:after
+                    int afi = spTag.indexOf("w:after=\"");
+                    if (afi >= 0) {
+                        try {
+                            int afs = afi + 9;
+                            float af = Integer.parseInt(spTag.substring(afs, spTag.indexOf("\"", afs)).trim()) / 20f;
+                            styleSpaceAfterMap.put(sid, new Float(af));
+                        } catch (Exception spe) {
+                            throw new ServiceException(spe);
+                        }
+                    }
+                    // w:line with lineRule="auto" → multiplier = value/240
+                    int lni = spTag.indexOf("w:line=\"");
+                    if (lni >= 0 && spTag.contains("lineRule=\"auto\"")) {
+                        try {
+                            int lns = lni + 8;
+                            float lm = Integer.parseInt(spTag.substring(lns, spTag.indexOf("\"", lns)).trim()) / 240f;
+                            styleLineMultMap.put(sid, new Float(lm));
+                        } catch (Exception spe) {throw new ServiceException(spe);}
+                    }
+                }
+            }
+
+            // FIX#7+12: resolve basedOn inheritance for color, size, AND spacing.
+            for (int pass = 0; pass < 10; pass++) {
+                List sids = new ArrayList(styleBaseMap.keySet());
+                for (int si = 0; si < sids.size(); si++) {
+                    String s = (String) sids.get(si);
+                    String p = (String) styleBaseMap.get(s);
+                    if (p == null) continue;
+                    if (!styleColorMap.containsKey(s) && styleColorMap.containsKey(p))
+                        styleColorMap.put(s, styleColorMap.get(p));
+                    if (!styleSizeMap.containsKey(s) && styleSizeMap.containsKey(p))
+                        styleSizeMap.put(s, styleSizeMap.get(p));
+                    if (!styleSpaceBeforeMap.containsKey(s) && styleSpaceBeforeMap.containsKey(p))
+                        styleSpaceBeforeMap.put(s, styleSpaceBeforeMap.get(p));
+                    if (!styleSpaceAfterMap.containsKey(s) && styleSpaceAfterMap.containsKey(p))
+                        styleSpaceAfterMap.put(s, styleSpaceAfterMap.get(p));
+                    if (!styleLineMultMap.containsKey(s) && styleLineMultMap.containsKey(p))
+                        styleLineMultMap.put(s, styleLineMultMap.get(p));
+                }
+            }
+        }
+    } catch (Exception se) {
+        Logger.getLogger().info("[2] styles.xml err: " + se.getMessage());
+        throw new ServiceException(se);
+    }
+    Logger.getLogger().info("[2] Styles: " + styleColorMap.size() + " colors, "
+        + styleSizeMap.size() + " sizes, " + styleBaseMap.size() + " inheritance links");
+
+    // ─── [3] Walk body elements ────────────────────────────────────────────
+    Logger.getLogger().info("[3] Walking body elements...");
+    List bodyElems = doc.getBodyElements();
+    for (int bi = 0; bi < bodyElems.size(); bi++) {
+        IBodyElement be = (IBodyElement) bodyElems.get(bi);
+
+        if (be instanceof XWPFParagraph) {
+            XWPFParagraph para = (XWPFParagraph) be;
+            String styleId = para.getStyleID();
+            boolean isHead  = styleId != null &&
+                (styleId.toLowerCase().startsWith("heading") ||
+                 styleId.toLowerCase().startsWith("title"));
+            boolean isTitle = styleId != null && styleId.equalsIgnoreCase("title");
+
+            // Alignment
+            String alignment = "left";
+            if (isTitle) {
+                alignment = "center";
+            } else {
+                try {
+                    String an = para.getAlignment().name();
+                    if      ("CENTER".equals(an)) alignment = "center";
+                    else if ("RIGHT".equals(an))  alignment = "right"; // FIX#5
+                } catch (Exception ae) {
+                    throw new ServiceException(ae);
+                }
+            }
+
+            // Font size — style lookup > heading defaults > BODY_SIZE
+            float fSize = BODY_SIZE;
+            if (styleId != null && styleSizeMap.containsKey(styleId)) {
+                fSize = ((Float) styleSizeMap.get(styleId)).floatValue();
+            } else if (isTitle) {
+                fSize = 24f;
+            } else if (styleId != null && styleId.toLowerCase().startsWith("heading")) {
+                char hn = styleId.length() > 7 ? styleId.charAt(7) : '2';
+                if      (hn == '1') fSize = 18f;
+                else if (hn == '2') fSize = 14f;
+                else                fSize = 13f;
+            }
+
+            // Style-level color (run color takes priority over this)
+            int[] styleColor = null;
+            if (styleId != null && styleColorMap.containsKey(styleId))
+                styleColor = (int[]) styleColorMap.get(styleId);
+
+            // FIX#8: detect list paragraphs by style name
+            String listPrefix = null;
+            if (styleId != null && styleId.toLowerCase().contains("list"))
+                listPrefix = "  * ";
+
+            // Collect runs and inline images
+            List paraRuns = new ArrayList();
+            List paraImgs = new ArrayList(); // FIX#3: images gathered in-order
+            boolean hasText = false;
+
+            List runs = para.getRuns();
+            for (int ri = 0; ri < runs.size(); ri++) {
+                XWPFRun run = (XWPFRun) runs.get(ri);
+
+                // FIX#3: collect inline images per-run; they will be emitted AFTER
+                // the paragraph element, preserving document flow order
+                List pics = run.getEmbeddedPictures();
+                for (int pi = 0; pi < pics.size(); pi++) {
+                    XWPFPicture    pic = (XWPFPicture)    pics.get(pi);
+                    XWPFPictureData pd  = pic.getPictureData();
+                    if (pd != null) {
+                        byte[] imgB = pd.getData();
+                        if (imgB != null && imgB.length > 0) paraImgs.add(imgB);
+                    }
+                }
+
+                String t = run.getText(0);
+                if (t == null || t.length() == 0) continue;
+                hasText = true;
+
+                // Color: explicit run > style > black
+                int[] rColor = styleColor != null ? styleColor : new int[]{0,0,0};
+                String rc = run.getColor();
+                if (rc != null && rc.length() == 6 && !rc.equalsIgnoreCase("auto")) {
+                    try {
+                        rColor = new int[]{
+                            Integer.parseInt(rc.substring(0,2),16),
+                            Integer.parseInt(rc.substring(2,4),16),
+                            Integer.parseInt(rc.substring(4,6),16)};
+                    } catch (Exception ce) {
+                        throw new ServiceException(ce);
+                    }
+                }
+
+                boolean rBold   = run.isBold()   || isHead;
+                boolean rItalic = run.isItalic(); // FIX#10: capture italic
+                paraRuns.add(new Object[]{t, rColor, new Boolean(rBold), new Boolean(rItalic)});
+            }
+
+            // FIX#12: resolve spacing from style for this paragraph
+            float spaceBefore = DEFAULT_SPACE_BEFORE;
+            float spaceAfter  = DEFAULT_SPACE_AFTER;
+            float lineMult    = LINE_MULT;
+            if (styleId != null) {
+                if (styleSpaceBeforeMap.containsKey(styleId))
+                    spaceBefore = ((Float) styleSpaceBeforeMap.get(styleId)).floatValue();
+                if (styleSpaceAfterMap.containsKey(styleId))
+                    spaceAfter = ((Float) styleSpaceAfterMap.get(styleId)).floatValue();
+                if (styleLineMultMap.containsKey(styleId))
+                    lineMult = ((Float) styleLineMultMap.get(styleId)).floatValue();
+            }
+
+            // FIX#2: empty paragraphs → "space" element with computed gap
+            if (!hasText && paraImgs.isEmpty()) {
+                // gap = one line of the paragraph's own font at its line multiplier + after spacing
+                float gap = fSize * lineMult + spaceAfter;
+                elemType.add("space");
+                elemParaIdx.add(null);
+                elemTableRows.add(null); elemTableCols.add(null);
+                elemImgBytes.add(null);
+                elemSpaceGap.add(new Float(gap));
+                continue;
+            }
+
+            if (hasText) {
+                int paraIdx = pRunsList.size();
+                pRunsList.add(paraRuns);
+                pSizes.add(new Float(fSize));
+                pAligns.add(alignment);
+                pIsHead.add(new Boolean(isHead));
+                pListItem.add(listPrefix);
+                pSpaceBefore.add(new Float(spaceBefore));
+                pSpaceAfter.add(new Float(spaceAfter));
+                pLineMult.add(new Float(lineMult));
+
+                elemType.add("para");
+                elemParaIdx.add(new Integer(paraIdx));
+                elemTableRows.add(null); elemTableCols.add(null);
+                elemImgBytes.add(null);
+                elemSpaceGap.add(null);
+            }
+
+            // FIX#3: emit images AFTER their paragraph (original code emitted before)
+            for (int ii = 0; ii < paraImgs.size(); ii++) {
+                elemType.add("image");
+                elemParaIdx.add(null);
+                elemTableRows.add(null); elemTableCols.add(null);
+                elemImgBytes.add(paraImgs.get(ii));
+                elemSpaceGap.add(null);
+            }
+
+        } else if (be instanceof XWPFTable) {
+            XWPFTable table = (XWPFTable) be;
+            List rows = table.getRows();
+            List tableData = new ArrayList();
+            int maxCols = 0;
+            for (int ri = 0; ri < rows.size(); ri++) {
+                XWPFTableRow row   = (XWPFTableRow) rows.get(ri);
+                List         cells = row.getTableCells();
+                if (cells.size() > maxCols) maxCols = cells.size();
+                List rowData = new ArrayList();
+                for (int ci = 0; ci < cells.size(); ci++) {
+                    String ct = ((XWPFTableCell) cells.get(ci)).getText();
+                    rowData.add(ct != null ? ct.trim() : "");
+                }
+                tableData.add(rowData);
+            }
+            if (maxCols == 0) continue;
+            elemType.add("table");
+            elemParaIdx.add(null);
+            elemTableRows.add(tableData); elemTableCols.add(new Integer(maxCols));
+            elemImgBytes.add(null);
+            elemSpaceGap.add(null);
+        }
+    }
+    Logger.getLogger().info("[3] Elements: " + elemType.size() +
+        " (" + pRunsList.size() + " paragraphs)");
+
+    // ─── [4] Claude API — optional text polish ────────────────────────────
+    Logger.getLogger().info("[4] Claude step...");
+    
+    if (apiKey == null || apiKey.trim().length() == 0) {
+        Logger.getLogger().info("[4] No CLAUDE_API_KEY — skipping Claude polish");
+    } else {
+        HttpURLConnection conn = null;
+        try {
+            StringBuffer rawBlock = new StringBuffer();
+            for (int i = 0; i < pRunsList.size(); i++) {
+                List prl = (List) pRunsList.get(i);
+                StringBuffer collapsed = new StringBuffer();
+                for (int ri = 0; ri < prl.size(); ri++)
+                    collapsed.append((String) ((Object[]) prl.get(ri))[0]);
+                rawBlock.append("PARA[" + i + "]: " + collapsed.toString() + "\n");
+            }
+
+            StringBuffer esc = new StringBuffer();
+            String rawStr = rawBlock.toString();
+            for (int i = 0; i < rawStr.length(); i++) {
+                char c = rawStr.charAt(i);
+                if      (c == '\\') esc.append("\\\\");
+                else if (c == '"')  esc.append("\\\"");
+                else if (c == '\n') esc.append("\\n");
+                else if (c == '\r') esc.append("\\r");
+                else if (c == '\t') esc.append("\\t");
+                else if (c < 0x20)  { esc.append("\\u00"); esc.append(Integer.toHexString(c)); }
+                else esc.append(c);
+            }
+            String escStr = esc.toString();
+            if (escStr.length() > 30000) escStr = escStr.substring(0, 30000);
+
+            String prompt = "Fix spacing and punctuation in each paragraph. "
+                + "Return EXACTLY the same PARA[N]: format, same count, same order. "
+                + "No commentary.\\n\\n" + escStr;
+            String reqBody = "{\"model\":\"" + MODEL + "\",\"max_tokens\":" + MAX_TOKENS
+                + ",\"messages\":[{\"role\":\"user\",\"content\":\"" + prompt + "\"}]}";
+
+            Logger.getLogger().info("[4] Calling Claude API (" + MODEL + ")...");
+            URL url2 = new URL(CLAUDE_URL);
+            conn = (HttpURLConnection) url2.openConnection();
+            conn.setConnectTimeout(15000);
+            conn.setReadTimeout(120000);
+            conn.setRequestMethod("POST");
+            conn.setRequestProperty("Content-Type", "application/json");
+            conn.setRequestProperty("x-api-key", apiKey);
+            conn.setRequestProperty("anthropic-version", "2023-06-01");
+            conn.setDoOutput(true);
+            DataOutputStream dos = new DataOutputStream(conn.getOutputStream());
+            dos.writeBytes(reqBody); dos.flush(); dos.close();
+
+            int status = conn.getResponseCode();
+            Logger.getLogger().info("[4] Status: " + status);
+            if (status == 200) {
+                BufferedReader br3 = new BufferedReader(
+                    new InputStreamReader(conn.getInputStream(), "UTF-8"));
+                StringBuffer resp = new StringBuffer();
+                String rln;
+                while ((rln = br3.readLine()) != null) resp.append(rln);
+                br3.close();
+
+                String rj = resp.toString();
+                int idx = rj.indexOf("\"text\":");
+                if (idx >= 0) {
+                    int start = rj.indexOf("\"", idx + 7) + 1, end = start;
+                    while (end < rj.length()) {
+                        char ch = rj.charAt(end);
+                        if (ch == '\\') end += 2; else if (ch == '"') break; else end++;
+                    }
+                    String extracted = rj.substring(start, end)
+                        .replaceAll("\\\\n", "\n").replaceAll("\\\\t", "\t")
+                        .replaceAll("\\\\\"", "\"").replaceAll("\\\\\\\\", "\\\\");
+
+                    String[] respLines = extracted.split("\n");
+                    for (int i = 0; i < respLines.length; i++) {
+                        String cl = respLines[i].trim();
+                        if (!cl.startsWith("PARA[")) continue;
+                        int close = cl.indexOf("]:");
+                        if (close <= 0) continue;
+                        try {
+                            int pidx = Integer.parseInt(cl.substring(5, close).trim());
+                            if (pidx < 0 || pidx >= pRunsList.size()) continue;
+                            String cleanedTxt = cl.substring(close + 2).trim();
+                            List prl = (List) pRunsList.get(pidx);
+                            // FIX#9b: Update first run's text with cleaned content.
+                            // Preserve color/bold/italic of ALL runs — do not collapse
+                            // to a single run as the original did (which destroyed
+                            // mixed-format paragraphs).
+                            if (prl.size() > 0) {
+                                Object[] fr = (Object[]) prl.get(0);
+                                prl.set(0, new Object[]{cleanedTxt, fr[1], fr[2], fr[3]});
+                                // Remove subsequent runs to avoid duplication
+                                while (prl.size() > 1) prl.remove(prl.size() - 1);
+                            }
+                        } catch (NumberFormatException nfe) {
+                            throw new ServiceException(nfe);
+                        }
+                    }
+                    Logger.getLogger().info("[4] Claude polish applied");
+                }
+            } else {
+                Logger.getLogger().info("[4] Claude error " + status + " — using originals");
+            }
+        } catch (Exception ce) {
+            Logger.getLogger().info("[4] Claude exception: " + ce.getMessage() + " — using originals");
+            throw new ServiceException(ce);
+        } finally {
+            if (conn != null) try { conn.disconnect(); } catch (Exception ex) {throw new ServiceException(ex);}
+        }
+    }
+
+    // ─── [5] Render PDF ───────────────────────────────────────────────────
+    Logger.getLogger().info("[5] Rendering PDF...");
+    ByteArrayOutputStream pdfBuf = new ByteArrayOutputStream();
+    PDDocument pdf = new PDDocument();
+    PDPage curPage = new PDPage(PDRectangle.A4);
+    pdf.addPage(curPage);
+    PDPageContentStream cs = new PDPageContentStream(pdf, curPage);
+    float y = PAGE_H - MARGIN;
+
+    for (int ei = 0; ei < elemType.size(); ei++) {
+        String etype = (String) elemType.get(ei);
+
+        // ── SPACE: empty paragraph — FIX#12 uses style-derived gap
+        if ("space".equals(etype)) {
+            float gap = elemSpaceGap.get(ei) != null
+                ? ((Float) elemSpaceGap.get(ei)).floatValue()
+                : (BODY_SIZE * LINE_MULT + DEFAULT_SPACE_AFTER);
+            y -= gap;
+            if (y < MARGIN) {
+                cs.close();
+                curPage = new PDPage(PDRectangle.A4); pdf.addPage(curPage);
+                cs = new PDPageContentStream(pdf, curPage);
+                y = PAGE_H - MARGIN;
+            }
+            continue;
+        }
+
+        // ── PARAGRAPH ────────────────────────────────────────────────────────
+        if ("para".equals(etype)) {
+            int    paraIdx    = ((Integer) elemParaIdx.get(ei)).intValue();
+            List   paraRuns   = (List) pRunsList.get(paraIdx);
+            float  fSz        = ((Float) pSizes.get(paraIdx)).floatValue();
+            String align      = (String) pAligns.get(paraIdx);
+            boolean isHead    = ((Boolean) pIsHead.get(paraIdx)).booleanValue();
+            String  lPfx      = (String) pListItem.get(paraIdx);
+            // FIX#12: use per-paragraph spacing from DOCX styles
+            float spaceBefore = ((Float) pSpaceBefore.get(paraIdx)).floatValue();
+            float spaceAfter  = ((Float) pSpaceAfter.get(paraIdx)).floatValue();
+            float lnH         = fSz * ((Float) pLineMult.get(paraIdx)).floatValue();
+            // Apply space-before (e.g. Heading1=24pt, Heading2=10pt)
+            if (spaceBefore > 0) y -= spaceBefore;
+
+            // Sanitize runs
+            List sanRuns = new ArrayList();
+            for (int ri = 0; ri < paraRuns.size(); ri++) {
+                Object[] ro  = (Object[]) paraRuns.get(ri);
+                String   san = sanitize((String) ro[0]);
+                if (san.length() > 0) sanRuns.add(new Object[]{san, ro[1], ro[2], ro[3]});
+            }
+            if (sanRuns.size() == 0) continue;
+
+            // FIX#8: prepend list bullet prefix to first run
+            if (lPfx != null) {
+                Object[] fr = (Object[]) sanRuns.get(0);
+                sanRuns.set(0, new Object[]{lPfx + fr[0], fr[1], fr[2], fr[3]});
+            }
+
+            // ── CENTERED ────────────────────────────────────────────────────
+            if ("center".equals(align)) {
+                StringBuffer ctSb = new StringBuffer();
+                for (int ri = 0; ri < sanRuns.size(); ri++)
+                    ctSb.append((String) ((Object[]) sanRuns.get(ri))[0]);
+                Object[]    fr0    = (Object[]) sanRuns.get(0);
+                boolean     ctBold = ((Boolean) fr0[2]).booleanValue();
+                int[]       ctCol  = (int[]) fr0[1];
+                PDType1Font ctFont = ctBold ? PDType1Font.HELVETICA_BOLD : PDType1Font.HELVETICA;
+
+                // FIX#1: wrap using real metrics, not character-count estimate
+                List ctLines = wrapToLines(ctSb.toString(), ctFont, fSz, CONTENT_W);
+                for (int li = 0; li < ctLines.size(); li++) {
+                    String cline = (String) ctLines.get(li);
+                    if (y < MARGIN + lnH) {
+                        cs.close(); curPage = new PDPage(PDRectangle.A4); pdf.addPage(curPage);
+                        cs = new PDPageContentStream(pdf, curPage); y = PAGE_H - MARGIN;
+                    }
+                    // FIX#1: center position from actual glyph width
+                    float lineW  = measureW(cline, ctFont, fSz);
+                    float startX = (PAGE_W - lineW) / 2f;
+                    if (startX < MARGIN) startX = MARGIN;
+                    cs.setNonStrokingColor(ctCol[0], ctCol[1], ctCol[2]);
+                    cs.beginText(); cs.setFont(ctFont, fSz); cs.newLineAtOffset(startX, y);
+                    try { cs.showText(cline); } catch (Exception te) {
+                        StringBuffer safe = new StringBuffer();
+                        for (int si = 0; si < cline.length(); si++) {
+                            char sc = cline.charAt(si); if (sc >= 0x20 && sc <= 0x7E) safe.append(sc);
+                        }
+                        try { cs.showText(safe.toString()); } catch (Exception te2) {throw new ServiceException(te2);}
+                    }
+                    cs.endText();
+                    y -= lnH;
+                }
+                y -= spaceAfter; // FIX#12
+                continue;
+            }
+
+            // ── RIGHT-ALIGNED ───────────────────────────────────────────────
+            // FIX#5: right-aligned paragraphs were rendered as left-aligned
+            if ("right".equals(align)) {
+                StringBuffer rtSb = new StringBuffer();
+                for (int ri = 0; ri < sanRuns.size(); ri++)
+                    rtSb.append((String) ((Object[]) sanRuns.get(ri))[0]);
+                Object[]    fr0    = (Object[]) sanRuns.get(0);
+                boolean     rtBold = ((Boolean) fr0[2]).booleanValue();
+                int[]       rtCol  = (int[]) fr0[1];
+                PDType1Font rtFont = rtBold ? PDType1Font.HELVETICA_BOLD : PDType1Font.HELVETICA;
+
+                List rtLines = wrapToLines(rtSb.toString(), rtFont, fSz, CONTENT_W);
+                for (int li = 0; li < rtLines.size(); li++) {
+                    String rline = (String) rtLines.get(li);
+                    if (y < MARGIN + lnH) {
+                        cs.close(); curPage = new PDPage(PDRectangle.A4); pdf.addPage(curPage);
+                        cs = new PDPageContentStream(pdf, curPage); y = PAGE_H - MARGIN;
+                    }
+                    float lineW  = measureW(rline, rtFont, fSz);
+                    float startX = PAGE_W - MARGIN - lineW;
+                    if (startX < MARGIN) startX = MARGIN;
+                    cs.setNonStrokingColor(rtCol[0], rtCol[1], rtCol[2]);
+                    cs.beginText(); cs.setFont(rtFont, fSz); cs.newLineAtOffset(startX, y);
+                    try { cs.showText(rline); } catch (Exception te) {throw new ServiceException(te);}
+                    cs.endText();
+                    y -= lnH;
+                }
+                y -= spaceAfter; // FIX#12
+                continue;
+            }
+
+            // ── LEFT-ALIGNED: per-run color/bold, word-by-word x tracking ────
+            // FIX#1: spW and wordW now use actual font metrics per run's font
+            float   x         = MARGIN;
+            boolean lineStart = true;
+
+            for (int ri = 0; ri < sanRuns.size(); ri++) {
+                Object[]    sr     = (Object[]) sanRuns.get(ri);
+                String      runTxt = (String) sr[0];
+                int[]       col    = (int[]) sr[1];
+                boolean     bld    = ((Boolean) sr[2]).booleanValue();
+                PDType1Font t1     = bld ? PDType1Font.HELVETICA_BOLD : PDType1Font.HELVETICA;
+                float       spW    = measureW(" ", t1, fSz); // FIX#1: per-font space width
+
+                // split(" ", -1) preserves empty tokens from consecutive spaces
+                String[] words = runTxt.split(" ", -1);
+                for (int wi = 0; wi < words.length; wi++) {
+                    String word = words[wi];
+                    if (word.length() == 0) {
+                        // empty token = extra space (e.g. double-space in source)
+                        if (!lineStart) x += spW;
+                        continue;
+                    }
+                    float wordW   = measureW(word, t1, fSz); // FIX#1: actual width
+                    float neededX = lineStart ? (x + wordW) : (x + spW + wordW);
+
+                    if (!lineStart && neededX > MARGIN + CONTENT_W) {
+                        y -= lnH; x = MARGIN; lineStart = true;
+                        if (y < MARGIN + lnH) {
+                            cs.close(); curPage = new PDPage(PDRectangle.A4); pdf.addPage(curPage);
+                            cs = new PDPageContentStream(pdf, curPage); y = PAGE_H - MARGIN;
+                        }
+                    }
+
+                    float drawX = lineStart ? x : (x + spW);
+                    cs.setNonStrokingColor(col[0], col[1], col[2]);
+                    cs.beginText(); cs.setFont(t1, fSz); cs.newLineAtOffset(drawX, y);
+                    try {
+                        cs.showText(word);
+                    } catch (Exception te) {
+                        StringBuffer safe = new StringBuffer();
+                        for (int si = 0; si < word.length(); si++) {
+                            char sc = word.charAt(si); if (sc >= 0x20 && sc <= 0x7E) safe.append(sc);
+                        }
+                        try { cs.showText(safe.toString()); } catch (Exception te2) {throw new ServiceException(te2);}
+                    }
+                    cs.endText();
+                    x = drawX + wordW;
+                    lineStart = false;
+                }
+            }
+
+            if (!lineStart) y -= lnH;
+            y -= spaceAfter; // FIX#12: style-defined space-after (e.g. Normal=8pt, Title=15pt)
+
+        // ── TABLE ────────────────────────────────────────────────────────────
+        } else if ("table".equals(etype)) {
+            List tableData = (List) elemTableRows.get(ei);
+            int  nCols     = ((Integer) elemTableCols.get(ei)).intValue();
+            if (tableData == null || tableData.size() == 0 || nCols == 0) continue;
+            Logger.getLogger().info("[5] Table: " + tableData.size() + " rows x " + nCols + " cols");
+
+            y -= TABLE_GAP;
+            float colW     = CONTENT_W / nCols;
+            float cellMaxW = colW - 2 * CELL_PAD;
+            PDType1Font bFont = PDType1Font.HELVETICA_BOLD;
+            PDType1Font nFont = PDType1Font.HELVETICA;
+
+            for (int ri = 0; ri < tableData.size(); ri++) {
+                List    rowData = (List) tableData.get(ri);
+                boolean isHdr   = (ri == 0);
+                PDType1Font rowFont = isHdr ? bFont : nFont;
+
+                // FIX#4: compute actual row height from word-wrapped cell content
+                int maxWrappedLines = 1;
+                for (int ci = 0; ci < nCols; ci++) {
+                    String raw = ci < rowData.size() ? (String) rowData.get(ci) : "";
+                    String san = sanitize(raw);
+                    List wrapped = wrapToLines(san, rowFont, BODY_SIZE, cellMaxW);
+                    if (wrapped.size() > maxWrappedLines) maxWrappedLines = wrapped.size();
+                }
+                float cellH = BODY_SIZE * LINE_MULT * maxWrappedLines + 2 * CELL_PAD;
+
+                if (y - cellH < MARGIN) {
+                    cs.close(); curPage = new PDPage(PDRectangle.A4); pdf.addPage(curPage);
+                    cs = new PDPageContentStream(pdf, curPage); y = PAGE_H - MARGIN;
+                }
+
+                // Header background
+                if (isHdr) {
+                    cs.setNonStrokingColor(214, 229, 240);
+                    cs.addRect(MARGIN, y - cellH, CONTENT_W, cellH);
+                    cs.fill();
+                }
+
+                // Cell borders and text
+                for (int ci = 0; ci < nCols; ci++) {
+                    float cx = MARGIN + ci * colW;
+                    cs.setStrokingColor(150, 150, 150);
+                    cs.addRect(cx, y - cellH, colW, cellH);
+                    cs.stroke();
+
+                    String cellTxt = ci < rowData.size() ? sanitize((String) rowData.get(ci)) : "";
+
+                    // FIX#4: word-wrap cell text (original code truncated it)
+                    List cellLines = wrapToLines(cellTxt, rowFont, BODY_SIZE, cellMaxW);
+                    float lineY = y - CELL_PAD - BODY_SIZE;
+                    for (int li = 0; li < cellLines.size(); li++) {
+                        String cline = (String) cellLines.get(li);
+                        if (cline.trim().length() == 0) { lineY -= BODY_SIZE * LINE_MULT; continue; }
+                        cs.setNonStrokingColor(0, 0, 0);
+                        cs.beginText(); cs.setFont(rowFont, BODY_SIZE);
+                        cs.newLineAtOffset(cx + CELL_PAD, lineY);
+                        try { cs.showText(cline); } catch (Exception te) {throw new ServiceException(te);}
+                        cs.endText();
+                        lineY -= BODY_SIZE * LINE_MULT;
+                    }
+                }
+                y -= cellH;
+            }
+            y -= TABLE_GAP;
+
+        // ── IMAGE ─────────────────────────────────────────────────────────────
+        } else if ("image".equals(etype)) {
+            byte[] imgBytes = (byte[]) elemImgBytes.get(ei);
+            if (imgBytes == null || imgBytes.length == 0) continue;
+            Logger.getLogger().info("[5] Image: " + imgBytes.length + " bytes");
+            try {
+                PDImageXObject img = PDImageXObject.createFromByteArray(pdf, imgBytes, "img");
+                float drawW = CONTENT_W;
+                float drawH = (float) img.getHeight() * (CONTENT_W / (float) img.getWidth());
+                float maxH  = (PAGE_H - 2 * MARGIN) * 0.80f;
+                if (drawH > maxH) { drawW = drawW * (maxH / drawH); drawH = maxH; }
+                y -= IMAGE_GAP;
+                if (y - drawH < MARGIN) {
+                    cs.close(); curPage = new PDPage(PDRectangle.A4); pdf.addPage(curPage);
+                    cs = new PDPageContentStream(pdf, curPage); y = PAGE_H - MARGIN;
+                }
+                cs.drawImage(img, MARGIN, y - drawH, drawW, drawH);
+                y -= drawH + IMAGE_GAP;
+                Logger.getLogger().info("[5] Image OK");
+            } catch (Exception ie) {
+                Logger.getLogger().info("[5] Image error: " + ie.getMessage());
+                throw new ServiceException(ie);
+            }
+        }
+    }
+
+    Logger.getLogger().info("[5] Render complete. Saving...");
+    cs.close();
+    pdf.save(pdfBuf);
+    pdf.close();
+    Logger.getLogger().info("[5] PDF bytes=" + pdfBuf.size());
+
+    Logger.getLogger().info("[6] Writing output...");
+    byte[] pdfBytes = pdfBuf.toByteArray();
+    outputStream.write(pdfBytes, 0, pdfBytes.length);
+    outputStream.flush();
+    Logger.getLogger().info("[6] Done. " + pdfBytes.length + " bytes written.");
+
+} catch (Throwable t) {
+    Logger.getLogger().info("FATAL: " + t.getClass().getName() + ": " + t.getMessage());
+    t.printStackTrace();
+} finally {
+    if (doc != null) try { doc.close(); } catch (Exception ex) {
+        throw new ServiceException(ex);
+    }
+}
