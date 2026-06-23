@@ -33,7 +33,7 @@ import java.security.spec.PKCS8EncodedKeySpec;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.Date;
+
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -47,10 +47,10 @@ import java.util.Map;
  *   import com.adeptia.custom.beans.SharePointDirectoryScanner;
  *   SharePointDirectoryScanner scanner = beanFactory.getBean(SharePointDirectoryScanner.class);
  *
- *   // File names only
- *   List names = scanner.scanDirectory(accountId, baseUrl, folderPath, true);
+ *   // Direct download URLs — click any entry to download the file
+ *   List urls = scanner.scanDirectory(accountId, baseUrl, folderPath, true);
  *
- *   // File names + metadata
+ *   // Direct download URLs + full metadata (size, timestamps, server-relative path)
  *   List infos = scanner.scanDirectoryWithMetadata(accountId, baseUrl, folderPath, true);
  */
 @Component("SharePointDirectoryScanner")
@@ -89,13 +89,15 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Returns a flat list of file names found under {@code folderPath}.
+     * Returns a flat list of direct download URLs for every file found under {@code folderPath}.
+     * Each URL is {@code tenantRoot + percent-encoded(serverRelativeUrl)} and triggers a file
+     * download when clicked — it does not open the SharePoint portal or Office Online viewer.
      *
      * @param accountId  Adeptia OAuth account activity ID for the SharePoint app
-     * @param baseUrl    SharePoint site base URL — e.g. https://tenant.sharepoint.com
-     * @param folderPath Server-relative folder path — e.g. /sites/MySite/Shared Documents/Reports
+     * @param baseUrl    SharePoint site or subsite URL — e.g. https://tenant.sharepoint.com/SG_Subsite
+     * @param folderPath Server-relative folder path — e.g. /SG_Subsite/Shared Documents/Target
      * @param recursive  true to walk into every subfolder recursively
-     * @return           Mutable list of file names (Name field only)
+     * @return           Mutable list of direct file download URLs
      */
     public List<String> scanDirectory(String accountId, String baseUrl,
                                       String folderPath, boolean recursive)
@@ -165,16 +167,17 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
      *
      * Expected context keys:
      *   accountId          — Adeptia OAuth account activity ID
-     *   sharepointBaseUrl  — SharePoint site base URL
+     *   sharepointBaseUrl  — SharePoint site or subsite URL
      *   folderPath         — Server-relative folder path
      *   recursive          — "true" / "false" (default: "false")
      *
      * Output context keys:
      *   fileCount  — int, total files found
-     *   fileNames  — newline-separated numbered list of file names
+     *   fileUrls   — newline-separated HTML anchor tags; use as $$fileUrls$$ inside an HTML template
+     *                e.g. <a href="https://…/file.xlsx">file.xlsx</a>
      */
     @Override
-    public void execute(ExecutionEvent event) throws ServiceException {
+    public void execute(ExecutionEvent event) {
         Context context = event.getContext();
         Logger  logger  = event.getLogger();
         try {
@@ -184,19 +187,27 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
             String  recurStr   = (String) context.get("recursive");
             boolean recursive  = "true".equalsIgnoreCase(recurStr);
 
-            List<String> files = scanDirectory(accountId, baseUrl, folderPath, recursive);
+            List<FileInfo> files = scanDirectoryWithMetadata(accountId, baseUrl, folderPath, recursive);
 
             context.put("fileCount", files.size());
-            StringBuilder numbered = new StringBuilder();
+            StringBuilder links = new StringBuilder();
             for (int i = 0; i < files.size(); i++) {
-                if (i > 0) numbered.append("\n");
-                numbered.append(i + 1).append(". ").append(files.get(i));
+                if (i > 0) links.append("\n");
+                FileInfo fi = files.get(i);
+                links.append(i + 1).append(". ")
+                     .append("<a href=\"").append(fi.downloadUrl).append("\">")
+                     .append(escapeHtml(fi.name))
+                     .append("</a>");
             }
-            context.put("fileNames", numbered.toString());
+            context.put("fileNames", links.toString());
             logger.info("SharePoint scan complete — " + files.size() + " file(s) in " + folderPath);
         } catch (Exception e) {
             context.put("fileCount", 0);
-            throw new ServiceException("SharePoint directory scan failed: " + e.getMessage());
+            try {
+                throw new ServiceException("SharePoint directory scan failed: " + e.getMessage());
+            } catch (ServiceException ex) {
+                throw new RuntimeException(ex);
+            }
         }
     }
 
@@ -205,11 +216,10 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Returns a valid Bearer token for the given account. If the stored token is
-     * expired (or within a 60-second safety buffer), or if {@code forceRefresh} is
-     * true (called after a mid-scan 401 or connection error), a fresh token is
-     * obtained directly from the Microsoft token endpoint using the SharePoint
-     * client-credentials flow and persisted back to the OAuthAccount.
+     * Returns a valid Bearer token for the given account. If {@code forceRefresh} is
+     * true (called after a mid-scan 401 or connection error), or if the stored token
+     * is absent, a fresh token is obtained from the Microsoft token endpoint using the
+     * SharePoint client-credentials flow and persisted back to the OAuthAccount.
      */
     private String resolveBearerToken(String accountId, boolean forceRefresh)
             throws IOException, InterruptedException, ServiceException {
@@ -221,16 +231,8 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
             throw new IllegalArgumentException("No OAuthAccount found for ID: " + accountId);
         }
 
-        Date    expiresAt     = account.getAccessTokenExpiresAt();
-        boolean nearlyExpired = expiresAt == null
-                || expiresAt.before(new Date(System.currentTimeMillis() + 60_000L));
-
-        if (forceRefresh || nearlyExpired) {
-            return "Bearer " + generateSharePointToken(account);
-        }
-
         String token = account.getAccessToken();
-        if (token == null || token.isBlank()) {
+        if (forceRefresh || token == null || token.isBlank()) {
             return "Bearer " + generateSharePointToken(account);
         }
         return "Bearer " + token;
@@ -279,7 +281,7 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
         body.append("&scope=").append(URLEncoder.encode(scope, StandardCharsets.UTF_8));
 
         boolean useCert = thumbprint != null && !thumbprint.isBlank()
-                       && privateKey  != null && !privateKey.isBlank();
+                && privateKey  != null && !privateKey.isBlank();
         if (useCert) {
             String jwt = buildClientAssertionJwt(clientId, thumbprint, privateKey, tokenUrl);
             body.append("&client_assertion_type=").append(URLEncoder.encode(
@@ -302,7 +304,7 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
         } catch (IOException e) {
             throw new IOException(
                     "Unable to reach Microsoft token endpoint — verify network connectivity "
-                    + "and tenant configuration: " + e.getMessage(), e);
+                            + "and tenant configuration: " + e.getMessage(), e);
         }
 
         if (response.statusCode() != 200) {
@@ -310,16 +312,15 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
                     + response.statusCode() + ": " + truncate(response.body(), 300));
         }
 
-        JsonNode json      = MAPPER.readTree(response.body());
-        String   token     = json.path("access_token").asText(null);
-        long     expiresIn = json.path("expires_in").asLong(3600);
+        JsonNode json  = MAPPER.readTree(response.body());
+        String   token = json.path("access_token").asText(null);
 
         if (token == null || token.isBlank()) {
             throw new IOException(
                     "Token response missing access_token: " + truncate(response.body(), 300));
         }
 
-        persistUpdatedToken(account, token, expiresIn);
+        persistUpdatedToken(account, token);
         return token;
     }
 
@@ -328,25 +329,18 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
      * so that future calls to {@link #resolveBearerToken} can use the cached value
      * instead of hitting the token endpoint again.
      *
-     * Mirrors the pattern from OAuthAccountService.getEntityManager(OAuthAccount):
-     * derives a Subject from the account's owner user, obtains a JdoEntityManager
-     * via EntityManagerFactory, and calls entityManager.update(account).
-     *
      * Failure here is non-fatal — the token is still valid in memory for the current
      * scan; the next scan will simply regenerate it if the entity was not updated.
      */
-    private void persistUpdatedToken(OAuthAccount account, String plainToken, long expiresInSeconds) throws ServiceException {
+    private void persistUpdatedToken(OAuthAccount account, String plainToken) throws ServiceException {
         try {
             account.setAccessToken(plainToken);
-            Date now = new Date();
-            account.setAccessTokenIssuesAt(now);
-            account.setAccessTokenExpiresAt(new Date(now.getTime() + expiresInSeconds * 1000L));
-            Subject    subject =  AuthUtil.getAdminSubject();
+            Subject          subject       = AuthUtil.getAdminSubject();
             JdoEntityManager entityManager =
                     (JdoEntityManager) EntityManagerFactory.getEntityManager(OAuthAccount.class, subject);
             entityManager.update(account);
         } catch (Exception ex) {
-           throw new ServiceException(ex.getMessage()); // Non-fatal: token is valid for the current scan; next scan regenerates if needed
+            throw new ServiceException(ex.getMessage());
         }
     }
 
@@ -359,7 +353,7 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
      * {@code client_assertion} parameter.
      */
     private String buildClientAssertionJwt(String clientId, String thumbprint,
-                                            String encodedPrivateKey, String tokenUrl) {
+                                           String encodedPrivateKey, String tokenUrl) {
         Map<String, String> header = new LinkedHashMap<>();
         header.put("alg", "RS256");
         header.put("x5t", hexThumbprintToBase64(thumbprint));
@@ -432,8 +426,9 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
             JsonNode page = fetchValueArray(url, bearerToken);
             if (page == null || page.isEmpty()) break;
 
+            String root = tenantRoot(baseUrl);
             for (JsonNode f : page) {
-                results.add(f.path("Name").asText());
+                results.add(root + encode(f.path("ServerRelativeUrl").asText()));
             }
             if (page.size() < PAGE_SIZE) break;
             skip += PAGE_SIZE;
@@ -456,13 +451,17 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
             JsonNode page = fetchValueArray(url, bearerToken);
             if (page == null || page.isEmpty()) break;
 
+            String root = tenantRoot(baseUrl);
             for (JsonNode f : page) {
+                String serverRelativeUrl = f.path("ServerRelativeUrl").asText();
+                String downloadUrl = root + encode(serverRelativeUrl);
                 results.add(new FileInfo(
                         f.path("Name").asText(),
-                        f.path("ServerRelativeUrl").asText(),
+                        serverRelativeUrl,
                         f.path("Length").asLong(0),
                         f.path("TimeCreated").asText(),
-                        f.path("TimeLastModified").asText()
+                        f.path("TimeLastModified").asText(),
+                        downloadUrl
                 ));
             }
             if (page.size() < PAGE_SIZE) break;
@@ -527,8 +526,8 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
         } catch (IOException e) {
             throw new IOException(
                     "Unable to connect to SharePoint at " + url
-                    + " — verify the base URL is reachable and network connectivity is available: "
-                    + e.getMessage(), e);
+                            + " — verify the base URL is reachable and network connectivity is available: "
+                            + e.getMessage(), e);
         }
 
         if (response.statusCode() == 404) return null;
@@ -547,6 +546,17 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
     }
 
     /**
+     * Returns just the scheme+host of {@code baseUrl} (e.g. "https://tenant.sharepoint.com").
+     * SharePoint's {@code ServerRelativeUrl} is always relative to the tenant root, not to
+     * a subsite, so building download URLs from the full baseUrl (which may include a subsite
+     * path like "/SG_Subsite") would double that segment and produce 404s.
+     */
+    private static String tenantRoot(String baseUrl) {
+        URI uri = URI.create(baseUrl);
+        return uri.getScheme() + "://" + uri.getHost();
+    }
+
+    /**
      * Percent-encodes each path segment individually so that '/' separators are
      * preserved verbatim. URLEncoder.encode on the full path would turn every '/'
      * into '%2F', which SharePoint REST rejects with a 400.
@@ -559,6 +569,13 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
             sb.append(URLEncoder.encode(segments[i], StandardCharsets.UTF_8).replace("+", "%20"));
         }
         return sb.toString();
+    }
+
+    private static String escapeHtml(String s) {
+        return s.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;");
     }
 
     private static String truncate(String s, int max) {
@@ -574,8 +591,11 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
         /** File name without path — e.g. "Q1_Report.xlsx" */
         public final String name;
 
-        /** Full server-relative URL — e.g. /sites/MySite/Shared Documents/Reports/Q1_Report.xlsx */
+        /** Server-relative path — e.g. /SG_Subsite/Shared Documents/Target/Q1_Report.xlsx */
         public final String serverRelativeUrl;
+
+        /** Direct download URL — tenant root + percent-encoded serverRelativeUrl; click to download the file */
+        public final String downloadUrl;
 
         /** File size in bytes */
         public final long sizeBytes;
@@ -587,17 +607,18 @@ public class SharePointDirectoryScanner implements ScriptExecutor {
         public final String timeLastModified;
 
         public FileInfo(String name, String serverRelativeUrl, long sizeBytes,
-                        String timeCreated, String timeLastModified) {
+                        String timeCreated, String timeLastModified, String downloadUrl) {
             this.name              = name;
             this.serverRelativeUrl = serverRelativeUrl;
             this.sizeBytes         = sizeBytes;
             this.timeCreated       = timeCreated;
             this.timeLastModified  = timeLastModified;
+            this.downloadUrl       = downloadUrl;
         }
 
         @Override
         public String toString() {
-            return "FileInfo{name='" + name + "', url='" + serverRelativeUrl
+            return "FileInfo{name='" + name + "', downloadUrl='" + downloadUrl
                     + "', size=" + sizeBytes + ", created='" + timeCreated
                     + "', modified='" + timeLastModified + "'}";
         }
