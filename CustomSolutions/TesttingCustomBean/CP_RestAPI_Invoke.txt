@@ -1,0 +1,53 @@
+import com.adeptia.indigo.system.IndigoConfig;
+import com.adeptia.api.rest.utils.RestUtils;
+import com.adeptia.api.rest.adapter.internal.service.OAuthProcessor;
+import com.adeptia.indigo.services.webservice.SecurityPolicy;
+import com.adeptia.indigo.services.webservice.WebServiceConstants;
+import com.adeptia.indigo.services.transport.account.OAuthAccount;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedHashMap;
+
+// ======== EDIT: values yahan ========
+String policyId   = "SecurityPolicy:1530277945945497600";
+String serviceUrl = "<Your Rest URL>";
+
+MultivaluedHashMap query = new MultivaluedHashMap();
+query.add("<key>", "<Value>");
+// =====================================
+
+context.put("REQ_url",   serviceUrl);
+context.put("REQ_query", query.toString());
+
+SecurityPolicy policy = IndigoConfig.getEntity(policyId, SecurityPolicy.class);
+MultivaluedHashMap headers = new MultivaluedHashMap();
+boolean isOAuth = policy != null && policy.isAuthentication()
+        && WebServiceConstants.SP_OAUTH_TYPE.equalsIgnoreCase(policy.getAuthType());
+
+if (isOAuth) {
+    OAuthProcessor.addOAuthAuthorization(policy, headers, query);
+}
+
+Response resp = RestUtils.invoke(serviceUrl, "GET", null, null, headers, query,
+        MediaType.APPLICATION_JSON_TYPE, policy, null, null, 30, 60);
+
+if (resp.getStatus() == 401 && isOAuth && policy.getOauthAccountId() != null) {
+    OAuthAccount acc = IndigoConfig.getEntity(policy.getOauthAccountId(), OAuthAccount.class);
+    if (acc != null && RestUtils.refreshOAuthToken(acc)) {
+        headers.clear();
+        OAuthProcessor.addOAuthAuthorization(policy, headers, query);
+        resp = RestUtils.invoke(serviceUrl, "GET", null, null, headers, query,
+                MediaType.APPLICATION_JSON_TYPE, policy, null, null, 30, 60);
+    }
+}
+
+context.put("Status Code", resp.getStatus());
+
+String responseData;
+try {
+    resp.bufferEntity();
+    responseData = resp.readEntity(String.class);
+} catch (Exception e) {
+    responseData = "READ_FAILED: " + e.getClass().getName() + ": " + e.getMessage();
+}
+context.put("RESP_body", responseData);
